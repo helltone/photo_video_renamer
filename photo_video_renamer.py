@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Photo and Video Metadata Renamer
-Recursively finds photos and videos in input directory and copies them to a flat output directory,
-renaming them based on metadata in format: YYYY-MM-DD_HH.MM.SS.SSSS_WIDTHxHEIGHT_HASH
+Recursively finds photos and videos in input directory and copies them to a structured output directory,
+organizing them into year/month folders and renaming them based on metadata in format: 
+YYYY-MM-DD_HH.MM.SS.SSSS_WIDTHxHEIGHT_HASH
 Output directory defaults to input_path + '_renamed'
+Use --in-place to move files within the same directory structure instead of copying
 """
 
 import os
@@ -152,7 +154,7 @@ def generate_hash(file_path, length=8):
         return "00000000"
 
 
-def copy_and_rename_file(file_path, output_dir, dry_run=False):
+def copy_and_rename_file(file_path, output_dir, dry_run=False, in_place=False):
     """Copy and rename photo or video to output directory based on metadata."""
     filename = os.path.basename(file_path)
     file_ext = os.path.splitext(filename)[1].lower()
@@ -172,16 +174,22 @@ def copy_and_rename_file(file_path, output_dir, dry_run=False):
     date_str = date_taken.strftime("%Y-%m-%d_%H.%M.%S")
     date_str += f".{microseconds}"
     
+    # Create structured folder: year/month (month as readable name)
+    year = date_taken.strftime("%Y")
+    month = date_taken.strftime("%B")  # Full month name (e.g., "January")
+    structured_dir = os.path.join(output_dir, year, month)
+    
     # Create new filename
     new_filename = f"{date_str}_{width}x{height}_{file_hash}{file_ext}"
-    new_path = os.path.join(output_dir, new_filename)
+    new_path = os.path.join(structured_dir, new_filename)
     
     # Check if file already exists and skip if it does
     if os.path.exists(new_path):
         if dry_run:
-            print(f"Would skip (already exists): {filename} -> {os.path.basename(new_path)}")
+            operation = "move" if in_place else "copy"
+            print(f"Would skip (already exists): {filename} -> {os.path.relpath(new_path, output_dir)}")
         else:
-            print(f"Skipped (already exists): {filename} -> {os.path.basename(new_path)}")
+            print(f"Skipped (already exists): {filename} -> {os.path.relpath(new_path, output_dir)}")
         return True
     
     # Handle duplicate filenames by adding counter (this part is now redundant but kept for safety)
@@ -193,15 +201,24 @@ def copy_and_rename_file(file_path, output_dir, dry_run=False):
         counter += 1
     
     if dry_run:
-        print(f"Would copy: {filename} -> {os.path.basename(new_path)}")
+        operation = "move" if in_place else "copy"
+        print(f"Would {operation}: {filename} -> {os.path.relpath(new_path, output_dir)}")
         return True
     
+    # Create directory structure if it doesn't exist
+    os.makedirs(structured_dir, exist_ok=True)
+    
     try:
-        shutil.copy2(file_path, new_path)
-        print(f"Copied: {filename} -> {os.path.basename(new_path)}")
+        if in_place:
+            shutil.move(file_path, new_path)
+            print(f"Moved: {filename} -> {os.path.relpath(new_path, output_dir)}")
+        else:
+            shutil.copy2(file_path, new_path)
+            print(f"Copied: {filename} -> {os.path.relpath(new_path, output_dir)}")
         return True
     except Exception as e:
-        print(f"Error copying {filename}: {e}")
+        operation = "moving" if in_place else "copying"
+        print(f"Error {operation} {filename}: {e}")
         return False
 
 
@@ -218,14 +235,46 @@ def find_media_files_recursively(directory_path):
                 yield os.path.join(root, file)
 
 
-def process_directory(input_directory, output_directory, dry_run=False):
-    """Process all images and videos in directory recursively and copy to flat output structure."""
+def process_directory(input_directory, output_directory, dry_run=False, start_year_month=None, in_place=False):
+    """Process all images and videos in directory recursively and copy/move to structured output."""
     if not os.path.isdir(input_directory):
         print(f"Input directory not found: {input_directory}")
         return
     
-    # Get media files generator
-    media_files = find_media_files_recursively(input_directory)
+    # Get all media files and their metadata for sorting
+    print("Scanning media files and extracting metadata...")
+    media_files_with_metadata = []
+    
+    for file_path in find_media_files_recursively(input_directory):
+        date_taken, width, height = get_file_metadata(file_path)
+        if date_taken is not None:
+            media_files_with_metadata.append((file_path, date_taken))
+        else:
+            print(f"Skipping {os.path.basename(file_path)} - could not extract metadata")
+    
+    if not media_files_with_metadata:
+        print("No supported image or video files with valid metadata found in directory tree")
+        return
+    
+    # Sort files by creation time (oldest first)
+    media_files_with_metadata.sort(key=lambda x: x[1])
+    
+    # Filter files to start from specified year/month if provided
+    if start_year_month:
+        try:
+            start_year, start_month = map(int, start_year_month.split('/'))
+            filtered_files = []
+            for file_path, date_taken in media_files_with_metadata:
+                if date_taken.year > start_year or (date_taken.year == start_year and date_taken.month >= start_month):
+                    filtered_files.append(file_path)
+            media_files = filtered_files
+            print(f"Found {len(media_files)} files from {start_year_month} onwards (sorted by creation time)")
+        except ValueError:
+            print(f"Invalid year/month format: {start_year_month}. Expected format: YYYY/MM")
+            return
+    else:
+        media_files = [file_path for file_path, _ in media_files_with_metadata]
+        print(f"Processing all {len(media_files)} files sorted by creation time")
     
     # Create output directory if it doesn't exist and not in dry run mode
     if not dry_run and not os.path.exists(output_directory):
@@ -238,11 +287,11 @@ def process_directory(input_directory, output_directory, dry_run=False):
     print("Processing media files...")
     for file_path in media_files:
         total_count += 1
-        if copy_and_rename_file(file_path, output_directory, dry_run):
+        if copy_and_rename_file(file_path, output_directory, dry_run, in_place):
             success_count += 1
     
     if total_count == 0:
-        print("No supported image or video files found in directory tree")
+        print("No files to process after filtering")
     else:
         print(f"\nProcessed {success_count}/{total_count} files successfully")
 
@@ -252,6 +301,8 @@ def main():
     parser.add_argument("input_path", help="Input directory path containing photos and videos")
     parser.add_argument("--output", "-o", help="Output directory path (defaults to input_path_renamed)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be copied/renamed without actually doing it")
+    parser.add_argument("--from-date", help="Start copying from this year/month onwards (format: YYYY/MM). Files will be sorted by creation time and copying will start from this date.")
+    parser.add_argument("--in-place", action="store_true", help="Move files within the same directory structure into year/month folders instead of copying to a new location")
     
     args = parser.parse_args()
     
@@ -263,21 +314,27 @@ def main():
         print(f"Input path must be a directory: {args.input_path}")
         sys.exit(1)
     
-    # Determine output directory
-    if args.output:
-        output_directory = args.output
+    # Handle in-place vs normal operation
+    if args.in_place:
+        if args.output:
+            print("Warning: --output is ignored when using --in-place")
+        output_directory = args.input_path
     else:
-        # Create output directory with '_renamed' suffix
-        output_directory = args.input_path.rstrip('/') + '_renamed'
+        # Determine output directory
+        if args.output:
+            output_directory = args.output
+        else:
+            # Create output directory with '_renamed' suffix
+            output_directory = args.input_path.rstrip('/') + '_renamed'
+        
+        # Check if output directory already exists
+        if os.path.exists(output_directory) and not args.dry_run:
+            response = input(f"Output directory '{output_directory}' already exists. Continue? (y/N): ")
+            if response.lower() != 'y':
+                print("Operation cancelled")
+                sys.exit(0)
     
-    # Check if output directory already exists
-    if os.path.exists(output_directory) and not args.dry_run:
-        response = input(f"Output directory '{output_directory}' already exists. Continue? (y/N): ")
-        if response.lower() != 'y':
-            print("Operation cancelled")
-            sys.exit(0)
-    
-    process_directory(args.input_path, output_directory, args.dry_run)
+    process_directory(args.input_path, output_directory, args.dry_run, args.from_date, args.in_place)
 
 
 if __name__ == "__main__":
