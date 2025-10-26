@@ -22,6 +22,45 @@ from pillow_heif import register_heif_opener
 
 register_heif_opener()
 
+# Supported media formats
+SUPPORTED_IMAGE_FORMATS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.gif', '.webp', '.heic'}
+SUPPORTED_VIDEO_FORMATS = {'.mov', '.mp4'}
+SUPPORTED_FORMATS = SUPPORTED_IMAGE_FORMATS | SUPPORTED_VIDEO_FORMATS
+
+
+def is_processable_media_file(file_path):
+    """Validate if file can actually be processed before attempting full metadata extraction."""
+    file_ext = os.path.splitext(file_path)[1].lower()
+
+    # Quick size check - skip empty or suspiciously small files
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size < 100:  # Skip files smaller than 100 bytes
+            return False, "File too small"
+    except OSError as e:
+        return False, f"Cannot access file: {e}"
+
+    # Try opening the file to verify it's valid
+    try:
+        if file_ext in SUPPORTED_VIDEO_FORMATS:
+            # Quick ffprobe check with timeout
+            cmd = ['ffprobe', '-v', 'quiet', '-show_streams', file_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=5)
+            if result.returncode != 0:
+                return False, "Invalid video file"
+            return True, None
+        elif file_ext in SUPPORTED_IMAGE_FORMATS:
+            # Quick PIL validation
+            with Image.open(file_path) as img:
+                img.verify()  # Verify it's a valid image
+            return True, None
+        else:
+            return False, "Unsupported format"
+    except subprocess.TimeoutExpired:
+        return False, "File validation timeout"
+    except Exception as e:
+        return False, f"Cannot open file: {str(e)[:50]}"
+
 
 def get_image_metadata(image_path):
     """Extract metadata from image file."""
@@ -140,27 +179,37 @@ def get_file_metadata(file_path):
         return get_image_metadata(file_path)
 
 
-def generate_hash(file_path, length=8):
-    """Generate hash from file content."""
-    hash_obj = hashlib.md5()
+def generate_hash(file_path, length=8, partial_size_mb=10):
+    """Generate hash from file content (partial for large files to improve performance)."""
+    hash_obj = hashlib.blake2b(digest_size=4)  # blake2b is faster than md5, 4 bytes = 8 hex chars
+    max_bytes = partial_size_mb * 1024 * 1024  # Convert MB to bytes
+    bytes_read = 0
+
     try:
         with open(file_path, 'rb') as f:
             # Read file in chunks to handle large files
             for chunk in iter(lambda: f.read(4096), b""):
                 hash_obj.update(chunk)
+                bytes_read += len(chunk)
+                # Only hash first 10MB for large files (faster for big videos)
+                if bytes_read >= max_bytes:
+                    break
         return hash_obj.hexdigest()[:length]
     except Exception as e:
         print(f"Error generating hash for {file_path}: {e}")
         return "00000000"
 
 
-def copy_and_rename_file(file_path, output_dir, dry_run=False, in_place=False):
+def copy_and_rename_file(file_path, output_dir, dry_run=False, in_place=False, cached_metadata=None):
     """Copy and rename photo or video to output directory based on metadata."""
     filename = os.path.basename(file_path)
     file_ext = os.path.splitext(filename)[1].lower()
-    
-    # Get metadata
-    date_taken, width, height = get_file_metadata(file_path)
+
+    # Use cached metadata if available, otherwise extract it
+    if cached_metadata:
+        date_taken, width, height = cached_metadata
+    else:
+        date_taken, width, height = get_file_metadata(file_path)
     
     if date_taken is None or width is None or height is None:
         print(f"Could not extract metadata from {filename}")
@@ -223,16 +272,24 @@ def copy_and_rename_file(file_path, output_dir, dry_run=False, in_place=False):
 
 
 def find_media_files_recursively(directory_path):
-    """Generate all image and video files recursively in directory and subdirectories."""
-    supported_formats = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.gif', '.webp', '.heic', '.mov', '.mp4'}
-    
+    """Generate all processable image and video files recursively in directory and subdirectories."""
     for root, dirs, files in os.walk(directory_path):
         for file in files:
             # Skip dot-prefixed files (hidden files like .DS_Store, thumbnails, etc.)
             if file.startswith('.'):
                 continue
-            if os.path.splitext(file)[1].lower() in supported_formats:
-                yield os.path.join(root, file)
+
+            file_path = os.path.join(root, file)
+            file_ext = os.path.splitext(file)[1].lower()
+
+            # Check extension first (fast check)
+            if file_ext in SUPPORTED_FORMATS:
+                # Validate file is actually processable (slower but prevents errors)
+                is_valid, error_msg = is_processable_media_file(file_path)
+                if is_valid:
+                    yield file_path
+                else:
+                    print(f"Skipping {file}: {error_msg}")
 
 
 def process_directory(input_directory, output_directory, dry_run=False, start_year_month=None, in_place=False):
@@ -240,41 +297,51 @@ def process_directory(input_directory, output_directory, dry_run=False, start_ye
     if not os.path.isdir(input_directory):
         print(f"Input directory not found: {input_directory}")
         return
-    
+
     # Get all media files and their metadata for sorting
     print("Scanning media files and extracting metadata...")
     media_files_with_metadata = []
-    
+    total_scanned = 0
+
     for file_path in find_media_files_recursively(input_directory):
-        date_taken, width, height = get_file_metadata(file_path)
+        total_scanned += 1
+        if total_scanned % 50 == 0:
+            print(f"  Scanned {total_scanned} files...", end='\r', flush=True)
+
+        metadata = get_file_metadata(file_path)
+        date_taken, width, height = metadata
+
         if date_taken is not None:
-            media_files_with_metadata.append((file_path, date_taken))
+            # Store both file path and full metadata for later use
+            media_files_with_metadata.append((file_path, date_taken, metadata))
         else:
-            print(f"Skipping {os.path.basename(file_path)} - could not extract metadata")
+            print(f"\nSkipping {os.path.basename(file_path)} - could not extract metadata")
     
     if not media_files_with_metadata:
-        print("No supported image or video files with valid metadata found in directory tree")
+        print("\nNo supported image or video files with valid metadata found in directory tree")
         return
-    
+
+    print(f"\nFound {len(media_files_with_metadata)} processable files")
+
     # Sort files by creation time (oldest first)
     media_files_with_metadata.sort(key=lambda x: x[1])
-    
+
     # Filter files to start from specified year/month if provided
     if start_year_month:
         try:
             start_year, start_month = map(int, start_year_month.split('/'))
             filtered_files = []
-            for file_path, date_taken in media_files_with_metadata:
+            for file_path, date_taken, metadata in media_files_with_metadata:
                 if date_taken.year > start_year or (date_taken.year == start_year and date_taken.month >= start_month):
-                    filtered_files.append(file_path)
-            media_files = filtered_files
-            print(f"Found {len(media_files)} files from {start_year_month} onwards (sorted by creation time)")
+                    filtered_files.append((file_path, metadata))
+            media_files_with_cached_metadata = filtered_files
+            print(f"Processing {len(media_files_with_cached_metadata)} files from {start_year_month} onwards (sorted by creation time)")
         except ValueError:
             print(f"Invalid year/month format: {start_year_month}. Expected format: YYYY/MM")
             return
     else:
-        media_files = [file_path for file_path, _ in media_files_with_metadata]
-        print(f"Processing all {len(media_files)} files sorted by creation time")
+        media_files_with_cached_metadata = [(file_path, metadata) for file_path, _, metadata in media_files_with_metadata]
+        print(f"Processing all {len(media_files_with_cached_metadata)} files sorted by creation time")
     
     # Create output directory if it doesn't exist and not in dry run mode
     if not dry_run and not os.path.exists(output_directory):
@@ -283,13 +350,14 @@ def process_directory(input_directory, output_directory, dry_run=False, start_ye
     
     success_count = 0
     total_count = 0
-    
+
     print("Processing media files...")
-    for file_path in media_files:
+    for file_path, cached_metadata in media_files_with_cached_metadata:
         total_count += 1
-        if copy_and_rename_file(file_path, output_directory, dry_run, in_place):
+        # Pass cached metadata to avoid re-extraction
+        if copy_and_rename_file(file_path, output_directory, dry_run, in_place, cached_metadata):
             success_count += 1
-    
+
     if total_count == 0:
         print("No files to process after filtering")
     else:
